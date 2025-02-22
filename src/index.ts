@@ -1,86 +1,69 @@
-import puppeteer from '@cloudflare/puppeteer';
+import { BigQuery } from '@google-cloud/bigquery';
 
 interface Env {
-	BROWSER: Fetcher;
 	DB: D1Database;
 }
 
-interface ReleaseNote {
-	release_at: string;
-	resource_name: string;
-	type: string;
-	sub_title: string;
-	content: string;
-}
-
 export default {
-	async fetch(req: Request, env: Env): Promise<Response> {
-		// last_released_at の固定値を設定
-		const lastReleasedAt = 'February 13, 2025';
-		const lastReleasedTimestamp = Date.parse(lastReleasedAt);
+	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+		await fetchAndStoreReleaseNotes(env);
+	},
+};
 
-		// Puppeteer の起動
-		const browser = await puppeteer.launch(env.BROWSER);
-		const page = await browser.newPage();
-		await page.goto('https://cloud.google.com/release-notes');
+async function fetchAndStoreReleaseNotes(env: Env) {
+	const bigquery = new BigQuery();
 
-		// クロール処理
-		const releaseNotes: ReleaseNote[] = await page.evaluate((lastReleasedAt: string) => {
-			interface MyElement {
-				textContent: string | null;
-				closest(selector: string): MyElement | null;
-				querySelector(selector: string): MyElement | null;
-				classList: { contains(className: string): boolean };
-			}
+	// JST（日本標準時）で今日の日付を取得（YYYY-MM-DD）
+	const today = new Date()
+		.toLocaleDateString('ja-JP', {
+			timeZone: 'Asia/Tokyo',
+			year: 'numeric',
+			month: '2-digit',
+			day: '2-digit',
+		})
+		.split('/')
+		.join('-'); // 2025/02/18 → 2025-02-18 に変換
 
-			// @ts-ignore
-			const notes = Array.from(document.querySelectorAll('.release-note')) as MyElement[];
+	// D1 から最新の published_at を取得
+	const latestPublishedAtResult = await env.DB.prepare('SELECT MAX(published_at) AS latest_published_at FROM release_notes').first<{
+		latest_published_at: string;
+	}>();
 
-			return notes
-				.map((note) => {
-					const releaseAt =
-						note.closest('.devsite-article')?.querySelector('.devsite-heading[role="heading"][aria-level="2"]')?.textContent?.trim() ||
-						'Unknown Date';
+	const latestPublishedAt = latestPublishedAtResult?.latest_published_at || '2000-01-01'; // デフォルト値（最初の取得時）
 
-					// リリース日を Date オブジェクトに変換
-					const releaseTimestamp = Date.parse(releaseAt);
+	console.log(`Fetching release notes from ${latestPublishedAt} to ${today}`);
 
-					// last_released_at 以前のデータは無視
-					if (isNaN(releaseTimestamp) || releaseTimestamp <= Date.parse(lastReleasedAt)) {
-						return null;
-					}
+	// BigQuery クエリ
+	const query = `
+    SELECT product_name, description, release_note_type, published_at
+    FROM \`bigquery-public-data.google_cloud_release_notes.release_notes\`
+    WHERE DATE(published_at) BETWEEN @latestPublishedAt AND @today
+    ORDER BY published_at ASC
+  `;
 
-					const resourceName = note.querySelector('.release-note-product-title')?.textContent?.trim() || 'Unknown Resource';
-					const subTitle = note.querySelector('.devsite-heading[role="heading"][aria-level="3"]')?.textContent?.trim() || 'No Subtitle';
+	const options = {
+		query,
+		params: { latestPublishedAt, today },
+		location: 'US',
+	};
 
-					const typeElement = note.closest('.release-feature') || note.closest('.release-changed');
-					const type = typeElement?.classList.contains('release-feature')
-						? 'feature'
-						: typeElement?.classList.contains('release-changed')
-						? 'changed'
-						: 'unknown';
+	try {
+		const [rows, job] = await bigquery.query(options);
 
-					const content = typeElement
-						? typeElement.textContent?.split('before').slice(1).join('before').trim() || 'No Content'
-						: 'No Content';
-
-					return { release_at: releaseAt, resource_name: resourceName, type, sub_title: subTitle, content };
-				})
-				.filter((note): note is ReleaseNote => note !== null);
-		}, lastReleasedAt);
-
-		// Puppeteer の終了
-		await browser.close();
-
-		// D1 へデータを保存
-		for (const note of releaseNotes) {
-			await env.DB.prepare('INSERT INTO release_notes (release_at, resource_name, type, sub_title, content) VALUES (?, ?, ?, ?, ?)')
-				.bind(note.release_at, note.resource_name, note.type, note.sub_title, note.content)
-				.run();
+		if (rows.length === 0) {
+			console.log(`No new release notes found between ${latestPublishedAt} and ${today}`);
+			return;
 		}
 
-		return new Response(JSON.stringify({ status: 'success', notes: releaseNotes }), {
-			headers: { 'Content-Type': 'application/json' },
-		});
-	},
-} satisfies ExportedHandler<Env>;
+		// D1 にデータを保存
+		const batch = env.DB.prepare(
+			'INSERT INTO release_notes (product_name, description, release_note_type, published_at) VALUES (?, ?, ?, ?)'
+		);
+		const insertPromises = rows.map((row) => batch.bind(row.product_name, row.description, row.release_note_type, row.published_at).run());
+
+		await Promise.all(insertPromises);
+		console.log(`Stored ${rows.length} new release notes in D1`);
+	} catch (error) {
+		console.error('Error fetching/storing release notes:', error);
+	}
+}
