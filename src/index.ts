@@ -8,6 +8,17 @@ export default {
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
 		await fetchAndStoreReleaseNotes(env);
 	},
+
+	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
+
+		if (url.pathname === '/run') {
+			await fetchAndStoreReleaseNotes(env);
+			return new Response('Manual fetch and store completed', { status: 200 });
+		}
+
+		return new Response('Cloudflare Worker is running', { status: 200 });
+	},
 };
 
 async function fetchAndStoreReleaseNotes(env: Env) {
