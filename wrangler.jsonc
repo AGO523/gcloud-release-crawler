@@ -17,10 +17,7 @@
 			"binding": "DB",
 			"database_name": "gcloud-release-crawler"
 		}
-	],
-	"browser": {
-		"binding": "BROWSER"
-	}
+	]
 
 	/**
 	 * Smart Placement
